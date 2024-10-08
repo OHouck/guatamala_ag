@@ -1,0 +1,596 @@
+---
+title: "Guatemala Parcels EDA"
+author: "Ozzy Houck"
+date: today
+format: 
+   html 
+execute:
+  eval: false 
+  echo: false
+---
+
+### Set up
+```{python}
+import os
+import ee
+import geemap
+import socket
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+import rasterio
+from shapely.geometry import box 
+from shapely.geometry import mapping
+import re # regular expressions
+import folium
+from folium import GeoJson
+from folium.plugins import MarkerCluster
+from rasterio.merge import merge
+from rasterio.mask import mask
+from rasterio.features import geometry_mask
+import json
+import warnings
+
+def setup_directories():
+    # check if we are on the server or local
+    nodename = socket.gethostname()
+    if nodename == "oMac.local": # local laptop
+        root = os.path.expanduser("~/OneDrive - The University of Chicago/guatamala_ag/data")
+    else:
+        raise Exception("Unknown environment, Please specify the root directory")
+
+    dirs = {
+        'root': root,
+        'raw': os.path.join(root, "raw"),
+        'processed': os.path.join(root, "processed"),
+        'fig': os.path.join(root, "../figures")
+    }
+
+    for path in dirs.values():
+        os.makedirs(path, exist_ok=True)
+
+    return dirs
+
+dir = setup_directories()
+
+```
+
+### Clean Coordinates
+
+```{python}
+def add_decimal_if_missing(coord):
+    if isinstance(coord, str) and coord.replace('-', '').isdigit():
+        if coord.startswith('-'):
+            return f"-{coord[1:3]}.{coord[3:]}"
+        else:
+            return f"{coord[:2]}.{coord[2:]}"
+    return coord
+
+def is_valid_guatemala_coordinate(lat, lon):
+    # Approximate bounding box for Guatemala
+    return 13.1 <= lat <= 18.2 and -93 <= lon <= -88.0
+
+def fix_known_coordinate_issues(df):
+    """
+    Fix known coordinate issues in the dataframe using approximate floating-point comparisons.
+    """
+    known_fixes = {
+        ('longitude_4', 90.366662): -90.366662,
+        ('latitude_1', 5.267439): 15.267439,
+        ('longitude_1', -16.352620): -90.1635620,
+    }
+    
+    for (col, incorrect_value), correct_value in known_fixes.items():
+        # Use numpy's isclose for approximate floating-point comparison
+        mask = np.isclose(df[col], incorrect_value, rtol=1e-5, atol=1e-8)
+        if mask.any():
+            df.loc[mask, col] = correct_value
+            print(f"Fixed {mask.sum()} occurrences of approximately {incorrect_value} to {correct_value} in {col}")
+    
+    return df
+
+def split_coordinates(coord_str):
+    # Existing manual fixes
+    manual_fixes = {
+        "16,3870407, -89,7345351": "16.3870407, -89.7345351",
+        "14.177150.3,-90.3989608": "14.1771503, -90.3989608",
+        "16,3869101, -89,7344694": "16.3869101, -89.7344694",
+        "14.141996-90-147208": "14.141996, -90.147208",
+        "16,3871767, -89,7348127": "16.3871767, -89.7348127",
+        "16,3869863, -89,7349780": "16.3869863, -89.7349780"
+    }
+    
+    if coord_str in manual_fixes:
+        coord_str = manual_fixes[coord_str]
+    
+    # Remove any quotation marks and leading/trailing whitespace
+    cleaned = coord_str.strip().strip('"')
+    
+    # Try to match various patterns
+    patterns = [
+        r'^([-]?\d+\.?\d*)[,\s]+([-]?\d+\.?\d*)$',  # Comma or space separated
+        r'^([-]?\d+\.?\d*)\.([-]?\d+\.?\d*)$',      # Period separated
+        r'^(\d+\.?\d*)(-\d+\.?\d*)$'                # No separator with negative longitude
+    ]
+    
+    for pattern in patterns:
+        # if we get passed the first pattern, remove all whitespace
+        cleaned = re.sub(r'\s', '', cleaned)
+        match = re.match(pattern, cleaned)
+        if match:
+            lat, lon = match.group(1), match.group(2)
+            lat = add_decimal_if_missing(lat)
+            lon = add_decimal_if_missing(lon)
+            return pd.Series({'latitude': lat, 'longitude': lon})
+    
+    # If we couldn't split it, return empty strings
+    print(f"Could not split coordinates: {coord_str}")
+    return pd.Series({'latitude': '', 'longitude': ''})
+
+df = pd.read_excel(os.path.join(dir['raw'], "Datos de Impacto Productores 2023.xlsx"), 
+    sheet_name= 0, skiprows=4)
+vars_to_keep = ["id_phone", "id_coordinates_1", "id_coordinates_2", 
+                "id_coordinates_3", "id_coordinates_4"]
+df = df[vars_to_keep]
+# drop rows with missing id_coordinates_1
+df = df.dropna(subset=["id_coordinates_1"])
+
+
+# Process coordinates
+for i in range(1, 5):
+    col_name = f'id_coordinates_{i}'
+    new_cols = df[col_name].apply(split_coordinates)
+    df[f'latitude_{i}'] = pd.to_numeric(new_cols['latitude'], errors='coerce')
+    df[f'longitude_{i}'] = pd.to_numeric(new_cols['longitude'], errors='coerce')
+    
+    # Check if coordinates are within Guatemala's range
+    df[f'valid_coordinate_{i}'] = df.apply(
+        lambda row: is_valid_guatemala_coordinate(row[f'latitude_{i}'], row[f'longitude_{i}']), 
+        axis=1
+    )
+
+# Fix known coordinate issues
+df = fix_known_coordinate_issues(df)
+
+# Recheck validity after fixes
+for i in range(1, 5):
+    df[f'valid_coordinate_{i}'] = df.apply(
+        lambda row: is_valid_guatemala_coordinate(row[f'latitude_{i}'], row[f'longitude_{i}']), 
+        axis=1
+    )
+
+# Print summary of remaining invalid coordinates
+for i in range(1, 5):
+    invalid_coords = df[~df[f'valid_coordinate_{i}']]
+    if not invalid_coords.empty:
+        print(f"\nRemaining invalid coordinates for id_coordinates_{i}:")
+        print(invalid_coords[[f'latitude_{i}', f'longitude_{i}']])
+
+# Check if all coordinates are valid
+all_valid = df.apply(lambda row: all(row[f'valid_coordinate_{i}'] for i in range(1, 5)), axis=1)
+print(f"\nTotal rows with all valid coordinates: {all_valid.sum()} out of {len(df)}")
+
+# Save the processed data
+df.to_csv(os.path.join(dir['processed'], "coordinates_processed.csv"), index=False)
+print("\nData processing complete. Results saved to 'coordinates_processed.csv'.")
+```
+
+### Convert to GeoDataFrame and Calculate Area
+```{python}
+# create lat and lon min and max columns
+df['lat_min'] = df[['latitude_1', 'latitude_2', 'latitude_3', 'latitude_4']].min(axis=1)
+df['lat_max'] = df[['latitude_1', 'latitude_2', 'latitude_3', 'latitude_4']].max(axis=1)
+df['lon_min'] = df[['longitude_1', 'longitude_2', 'longitude_3', 'longitude_4']].min(axis=1)
+df['lon_max'] = df[['longitude_1', 'longitude_2', 'longitude_3', 'longitude_4']].max(axis=1)
+
+# Function to create a polygon from min/max coordinates
+# jury is out on which is better
+def create_polygon(row):
+    return box(row['lon_min'], row['lat_min'], row['lon_max'], row['lat_max'])
+
+# Alternative Function to create a polygon from coordinates
+# def create_polygon(row):
+#     coords = [
+#         (float(row['longitude_1']), float(row['latitude_1'])),
+#         (float(row['longitude_2']), float(row['latitude_2'])),
+#         (float(row['longitude_3']), float(row['latitude_3'])),
+#         (float(row['longitude_4']), float(row['latitude_4'])),
+#         (float(row['longitude_1']), float(row['latitude_1']))  # Close the polygon
+#     ]
+#     return Polygon(coords)
+
+
+# Create the geometry column
+df['geometry'] = df.apply(create_polygon, axis=1)
+
+crs = "EPSG:5459" # crs for guatemala
+gdf = gpd.GeoDataFrame(df, geometry='geometry', crs=crs)
+
+# Function to calculate area in square meters
+def calculate_area(geometry, lat):
+    # Define a local projection centered on the polygon
+    local_azimuthal_projection = f"+proj=aeqd +lat_0={lat}\
+        +lon_0={geometry.centroid.x} +x_0=0 +y_0=0"
+    
+    # Create a GeoSeries with the input geometry and set its CRS
+    geoseries = gpd.GeoSeries([geometry], crs="EPSG:4326")
+    
+    # Project the GeoSeries to the local azimuthal equidistant projection
+    projected_geoseries = geoseries.to_crs(local_azimuthal_projection)
+    
+    # Get the projected geometry and calculate its area
+    projected_geometry = projected_geoseries.iloc[0]
+
+    area = projected_geometry.area
+
+    # check if area is nan
+    if pd.isna(area):
+        print(f"Area is nan for {geometry}")
+        # print the lat and lon
+        print(f"Lat: {lat}, Lon: {geometry.centroid.x}")
+        return
+
+    return area 
+
+# create an id column
+gdf['id'] = range(len(gdf))
+
+# Calculate area for each polygon
+gdf['area_sqm'] = gdf.apply(lambda row: calculate_area(row['geometry'], 
+                            row['geometry'].centroid.y), axis=1)
+
+# count number of rows with area over 1 million sqm
+print(f"Number of rows with area over 500k sqm: {len(gdf[gdf['area_sqm'] > 500_000])}")
+
+# drop rows with area over 0.5 million sqm (5k by 5k meters)
+gdf = gdf[gdf['area_sqm'] < 500_000]
+
+# Display info about the GeoDataFrame
+print(f"\nGeoDataFrame shape: {gdf.shape}")
+print(f"GeoDataFrame CRS: {gdf.crs}")
+
+# print summary statistics for area and round to 2 decimal places
+print(gdf['area_sqm'].describe().round(2))
+
+# save the geodataframe
+gdf.to_file(os.path.join(dir['processed'], "cleaned_parcels.geojson"), driver='GeoJSON')
+```
+
+### Pull Sentinel 2 Imagery from Google Earth Engine
+
+```{python}
+def get_sentinel2_imagery_multi(geometries, ids, start_date, end_date, output_dir, 
+                                bands_to_save, max_cloud_cover=10):
+    ee.Initialize()
+
+    
+    for geom, id in zip(geometries, ids):
+        try:
+            ee_geometry = ee.Geometry.Polygon(list(geom.exterior.coords))
+            
+            s2_collection = (ee.ImageCollection('COPERNICUS/S2_SR')
+                             .filterBounds(ee_geometry)
+                             .filterDate(start_date, end_date)
+                             .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', max_cloud_cover)))
+            
+            if s2_collection.size().getInfo() == 0:
+                print(f"No images found for geometry {id}. Skipping.")
+                continue
+
+            # normalized difference vegetation index
+            def addNDVI(image):
+                ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+                return image.addBands(ndvi)
+
+            # green chlorophyl vegetation index (not using but used in SCYM)
+            def addGCVI(image):
+                gcvi = image.normalizedDifference(['B8', 'B3']).rename('GCVI')  # B8: NIR, B3: Green
+                return image.addBands(gcvi)
+
+            # Add NDVI band
+            s2_collection = s2_collection.map(addNDVI)
+
+            # Sort by NDVI and select the image with the highest NDVI
+            s2_collection = s2_collection.sort('NDVI', False)
+            selected_image = ee.Image(s2_collection.first())
+            
+            clipped = selected_image.clip(ee_geometry)
+            output_file = os.path.join(output_dir, f"sentinel_image_{id}.tif")
+
+            geemap.ee_export_image(clipped, filename=output_file, scale=10, region=ee_geometry)
+
+            # Save band information
+            band_info = {i+1: name for i, name in enumerate(bands_to_save)}
+            with open(os.path.join(output_dir, f"sentinel_image_{id}_bands.json"), 'w') as f:
+                json.dump(band_info, f)
+            
+            print(f"Sentinel image for geometry {id} saved to {output_file}")
+            
+        except Exception as e:
+            print(f"Error processing geometry {id}: {str(e)}")
+
+    print("All individual Sentinel images have been saved.")
+
+# Usage
+geometries = gdf.geometry.tolist()
+ids = gdf.id.tolist()
+
+# # take 10 percent sample for testing
+geometries = geometries[::10]
+ids = ids[::10]
+
+output_dir = os.path.join(dir['processed'], "sentinel_images")
+os.makedirs(output_dir, exist_ok=True)
+
+# currently saving all bands but might not be necessary
+bands_to_save = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 
+                    'B9', 'B10', 'B11', 'B12', "NDVI", "id"]
+
+get_sentinel2_imagery_multi(geometries, ids, '2023-01-01', '2023-06-30', 
+                            output_dir, bands_to_save)
+```
+
+### Combine TIF Files into a single raster
+
+```{python}
+import os
+import rasterio
+import numpy as np
+from rasterio.merge import merge
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.features import geometry_mask
+from shapely.geometry import box, mapping
+from geopandas import GeoDataFrame
+import json
+import warnings
+
+warnings.filterwarnings("ignore", message="TIFFReadDirectory")
+
+def get_band_info(file_path):
+    json_path = file_path.rsplit('.', 1)[0] + '_bands.json'
+    if os.path.exists(json_path):
+        with open(json_path, 'r') as f:
+            return json.load(f)
+    return None
+
+def combine_tif_files(input_dir, output_file, bands_to_save, dst_crs='EPSG:4326'):
+    tif_files = [os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith('.tif')]
+    print(f"Found {len(tif_files)} TIF files")
+
+    if not tif_files:
+        raise ValueError(f"No TIF files found in {input_dir}")
+
+    bounds_list = []
+    src_files_to_mosaic = []
+    band_info_list = []
+
+    for file in tif_files:
+        with rasterio.open(file) as src:
+            # Reproject bounds to the target CRS
+            left, bottom, right, top = src.bounds
+            dst_transform, width, height = calculate_default_transform(
+                src.crs, dst_crs, src.width, src.height, left, bottom, right, top)
+            
+            bounds = rasterio.coords.BoundingBox(
+                left, bottom, right, top)
+            bounds_list.append(bounds)
+            
+            band_info = get_band_info(file)
+            if band_info:
+                band_info_list.append(band_info)
+            else:
+                print(f"Warning: No band info found for {file}")
+        
+        src_files_to_mosaic.append(file)
+
+    if band_info_list:
+        available_bands = list(band_info_list[0].values())
+        print(f"Available bands: {available_bands}")
+    else:
+        with rasterio.open(src_files_to_mosaic[0]) as src:
+            available_bands = src.descriptions
+        print(f"Warning: Using default band names. Available bands: {available_bands}")
+
+    bands_to_save = [band for band in bands_to_save if band in available_bands]
+    if not bands_to_save:
+        raise ValueError("None of the specified bands are available in the source files.")
+    
+    print(f"Bands to be saved: {bands_to_save}")
+
+    # Calculate the overall bounds
+    overall_bounds = rasterio.coords.BoundingBox(
+        left=min(bound.left for bound in bounds_list),
+        bottom=min(bound.bottom for bound in bounds_list),
+        right=max(bound.right for bound in bounds_list),
+        top=max(bound.top for bound in bounds_list)
+    )
+
+    # Create a mask for the farm parcels
+    mask_shape = box(*overall_bounds)
+    geo = GeoDataFrame({'geometry': [mask_shape]}, crs=dst_crs)
+
+    # Perform the mosaic operation with reprojection
+    ## XX ERROR HERE
+    mosaic, out_transform = merge(src_files_to_mosaic, dst_crs=dst_crs, resampling=Resampling.nearest)
+
+    # Get metadata from the first file and update it
+    with rasterio.open(src_files_to_mosaic[0]) as src:
+        meta = src.meta.copy()
+
+    meta.update({
+        'crs': dst_crs,
+        'transform': out_transform,
+        'width': mosaic.shape[2],
+        'height': mosaic.shape[1],
+        'count': len(bands_to_save),
+        'nodata': 0,
+        'dtype': 'float32'
+    })
+
+    # Create a mask for areas outside the farm parcels
+    mask = geometry_mask([mapping(geo.geometry.iloc[0])], 
+        out_shape=mosaic.shape[1:], transform=out_transform, invert=True)
+
+    # Apply the mask to the mosaic
+    mosaic = np.ma.masked_array(mosaic, np.broadcast_to(mask, mosaic.shape))
+
+    # Write the output file
+    with rasterio.open(output_file, "w", **meta) as dest:
+        for i, band_name in enumerate(bands_to_save):
+            if band_info_list:
+                band_index = list(band_info_list[0].values()).index(band_name)
+            else:
+                band_index = available_bands.index(band_name)
+            dest.write(mosaic[band_index], i+1)
+            dest.set_band_description(i+1, band_name)
+
+    print(f"Combined raster saved to {output_file} with CRS: {dst_crs}")
+
+# Usage
+input_dir = os.path.join(dir['processed'], "sentinel_images")
+output_file = os.path.join(dir['processed'], "merged_sentinel_image.tif")
+bands_to_save = ['B2', 'B3', 'B4', 'B8', 'NDVI']  # Adjust as needed
+
+combine_tif_files(input_dir, output_file, bands_to_save)
+```
+
+### Create interactive map with folium
+
+```{python}
+import rasterio
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+def verify_data(raster_file, parcel_file):
+    # Check raster data
+    with rasterio.open(raster_file) as src:
+        print(f"Raster CRS: {src.crs}")
+        print(f"Raster Bounds: {src.bounds}")
+        print(f"Raster Shape: {src.shape}")
+        
+        # Plot the first band of the raster
+        plt.figure(figsize=(10, 10))
+        plt.imshow(src.read(1), cmap='viridis')
+        plt.title("First Band of Raster Data")
+        plt.colorbar()
+        plt.savefig("raster_preview.png")
+        plt.close()
+
+    # Check parcel data
+    parcels = gpd.read_file(parcel_file)
+    print(f"Parcels CRS: {parcels.crs}")
+    print(f"Number of parcels: {len(parcels)}")
+    print(f"Parcels Bounds: {parcels.total_bounds}")
+    
+    # Plot parcels
+    parcels.plot(figsize=(10, 10))
+    plt.title("Parcel Boundaries")
+    plt.savefig("parcels_preview.png")
+    plt.close()
+
+    return parcels
+
+# Use the function
+raster_file = os.path.join(dir['processed'], "merged_sentinel_image.tif")
+parcel_file = os.path.join(dir['processed'], "cleaned_parcels.geojson")
+parcels = verify_data(raster_file, parcel_file)
+
+# Check if parcels intersect with raster
+with rasterio.open(raster_file) as src:
+    raster_bounds = src.bounds
+    raster_geom = gpd.GeoDataFrame({'geometry': [box(*raster_bounds)]}, crs=src.crs)
+    parcels_reprojected = parcels.to_crs(src.crs)
+    intersection = gpd.overlay(parcels_reprojected, raster_geom, how='intersection')
+    print(f"Number of parcels intersecting with raster: {len(intersection)}")
+
+```
+
+```{python}
+import os
+import rasterio
+import numpy as np
+import folium
+from folium import raster_layers
+import geopandas as gpd
+from rasterio.warp import transform_bounds
+from pyproj import Transformer
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def create_interactive_map(raster_file, parcel_file, output_file, max_zoom=18):
+    try:
+        logging.info("Starting to create interactive map")
+        
+        # Read the raster file
+        with rasterio.open(raster_file) as src:
+            logging.info(f"Opened raster file: {raster_file}")
+            
+            # Get raster metadata without reading all the data
+            bounds = src.bounds
+            transform = src.transform
+            crs = src.crs
+            
+            # Transform bounds to lat/lon (EPSG:4326)
+            transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+            minx, miny = transformer.transform(bounds.left, bounds.bottom)
+            maxx, maxy = transformer.transform(bounds.right, bounds.top)
+        
+        logging.info("Transformed raster bounds to lat/lon")
+
+        # Read the parcel shapefile
+        parcels = gpd.read_file(parcel_file)
+        logging.info(f"Read parcel file: {parcel_file}")
+
+         # Get the centroid of the first parcel
+        first_parcel_centroid = parcels.iloc[0].geometry.centroid
+        center_lat, center_lon = first_parcel_centroid.y, first_parcel_centroid.x
+
+        # Create a map centered on the first parcel
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=16, max_zoom=max_zoom)
+
+        # Add the raster layer as a TileLayer for memory efficiency
+        url = f"http://localhost:8080/raster/{os.path.basename(raster_file)}" + "/{z}/{x}/{y}.png"
+        raster_layer = folium.raster_layers.TileLayer(
+            tiles=url,
+            attr="Raster Data",
+            name="Raster Layer",
+            overlay=True,
+            opacity=0.7
+        )
+        raster_layer.add_to(m)
+
+        logging.info("Added raster layer to map")
+
+        # Add parcel boundaries
+        folium.GeoJson(
+            parcels,
+            name="Farm Parcels",
+            style_function=lambda feature: {
+                'fillColor': 'blue',
+                'color': 'black',
+                'weight': 2,
+                'fillOpacity': 0.1,
+            }
+        ).add_to(m)
+
+        logging.info("Added parcel boundaries to map")
+
+        # Add a layer control
+        folium.LayerControl().add_to(m)
+
+        # Save the map
+        m.save(output_file)
+        logging.info(f"Interactive map saved to {output_file}")
+
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}", exc_info=True)
+        raise
+
+raster_file = os.path.join(dir['processed'], "merged_sentinel_image.tif")
+parcel_file= os.path.join(dir['processed'], "cleaned_parcels.geojson") 
+output_file = os.path.join(dir['fig'], "interactive_map.html")
+
+create_interactive_map(raster_file, parcel_file, output_file)
+```
