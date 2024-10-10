@@ -254,6 +254,42 @@ print(gdf['area_sqm'].describe().round(2))
 
 # save the geodataframe
 gdf.to_file(os.path.join(dir['processed'], "cleaned_parcels.geojson"), driver='GeoJSON')
+
+# create geometry object of all parcels for plotting in earth engine
+ee_geometry = ee.Geometry.MultiPolygon(list(gdf.geometry.apply(lambda x: mapping(x)))) # XX this causes a KeyError: 0 error
+```
+
+
+### Create Interactive Map showing sentenial 2 imagery and parcel boundaries using GEE
+```{python}
+# Initialize Earth Engine
+ee.Initialize()
+
+# Create an interactive map
+Map = geemap.Map()
+
+# Load the Sentinel-2 image collection
+s2_collection = (ee.ImageCollection('COPERNICUS/S2_SR')
+                 .filterDate('2023-01-01', '2023-06-30')
+                 .filterBounds(ee.FeatureCollection(gdf.__geo_interface__))
+                 .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+                 .select(['B4', 'B3', 'B2']))
+
+# Create a median composite
+s2_median = s2_collection.median()
+
+clipped = s2_median.clip(ee_geometry)
+
+# Add the Sentinel-2 layer
+Map.addLayer(s2_median, {'min': 0, 'max': 3000}, 'Sentinel-2 Median')
+
+# Add the farm parcels
+Map.add_gdf(gdf, layer_name = 'Farm Parcels', fill_colors=['red'])
+
+
+# Display the map
+Map.save(os.path.join(dir['fig'], 'interactive_map_geemap.html'))
+print(f"Interactive map saved to {os.path.join(dir['fig'], 'interactive_map_geemap.html')}")
 ```
 
 ### Pull Sentinel 2 Imagery from Google Earth Engine
@@ -330,121 +366,114 @@ get_sentinel2_imagery_multi(geometries, ids, '2023-01-01', '2023-06-30',
                             output_dir, bands_to_save)
 ```
 
-### Combine TIF Files into a single raster
+```{python}
+import rasterio
+from rasterio.merge import merge
+import glob
+import os
+
+# Define the directory containing your Sentinel-2 images
+input_dir = os.path.join(dir['processed'], "sentinel_images")
+
+# Get a list of all .tif files
+tif_files = glob.glob(os.path.join(input_dir, 'sentinel_image_*.tif'))
+
+# Open all the images
+src_files_to_mosaic = []
+for tif in tif_files:
+    src = rasterio.open(tif)
+    src_files_to_mosaic.append(src)
+
+# Merge them into a single mosaic
+mosaic, out_trans = merge(src_files_to_mosaic)
+
+# Update the metadata
+out_meta = src.meta.copy()
+out_meta.update({
+    "driver": "GTiff",
+    "height": mosaic.shape[1],
+    "width": mosaic.shape[2],
+    "transform": out_trans,
+    "crs": src.crs
+})
+
+# Write the mosaic to disk
+mosaic_path = os.path.join(input_dir, "sentinel_mosaic.tif")
+with rasterio.open(mosaic_path, "w", **out_meta) as dest:
+    dest.write(mosaic)
+
+print(f"Mosaic saved to {mosaic_path}")
+```
+
+
+
+
+
+
+
+
+
+### Combine TIF Files into a single raster (OLD CODE )
 
 ```{python}
 import os
 import rasterio
-import numpy as np
 from rasterio.merge import merge
 from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.features import geometry_mask
-from shapely.geometry import box, mapping
-from geopandas import GeoDataFrame
-import json
-import warnings
 
-warnings.filterwarnings("ignore", message="TIFFReadDirectory")
-
-def get_band_info(file_path):
-    json_path = file_path.rsplit('.', 1)[0] + '_bands.json'
-    if os.path.exists(json_path):
-        with open(json_path, 'r') as f:
-            return json.load(f)
-    return None
-
-def combine_tif_files(input_dir, output_file, bands_to_save, dst_crs='EPSG:4326'):
+def combine_tif_files(input_dir, output_file, bands_to_save, dst_crs=None):
+    # Get all the tif files from the input directory
     tif_files = [os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith('.tif')]
-    print(f"Found {len(tif_files)} TIF files")
 
-    if not tif_files:
-        raise ValueError(f"No TIF files found in {input_dir}")
+    # Open all the tif files
+    src_files_to_mosaic = [rasterio.open(f) for f in tif_files]
 
-    bounds_list = []
-    src_files_to_mosaic = []
-    band_info_list = []
+    # Merge the files into a mosaic
+    mosaic, out_transform = merge(src_files_to_mosaic)
 
-    for file in tif_files:
-        with rasterio.open(file) as src:
-            # Reproject bounds to the target CRS
-            left, bottom, right, top = src.bounds
-            dst_transform, width, height = calculate_default_transform(
-                src.crs, dst_crs, src.width, src.height, left, bottom, right, top)
-            
-            bounds = rasterio.coords.BoundingBox(
-                left, bottom, right, top)
-            bounds_list.append(bounds)
-            
-            band_info = get_band_info(file)
-            if band_info:
-                band_info_list.append(band_info)
-            else:
-                print(f"Warning: No band info found for {file}")
-        
-        src_files_to_mosaic.append(file)
-
-    if band_info_list:
-        available_bands = list(band_info_list[0].values())
-        print(f"Available bands: {available_bands}")
-    else:
-        with rasterio.open(src_files_to_mosaic[0]) as src:
-            available_bands = src.descriptions
-        print(f"Warning: Using default band names. Available bands: {available_bands}")
-
-    bands_to_save = [band for band in bands_to_save if band in available_bands]
-    if not bands_to_save:
-        raise ValueError("None of the specified bands are available in the source files.")
-    
-    print(f"Bands to be saved: {bands_to_save}")
-
-    # Calculate the overall bounds
-    overall_bounds = rasterio.coords.BoundingBox(
-        left=min(bound.left for bound in bounds_list),
-        bottom=min(bound.bottom for bound in bounds_list),
-        right=max(bound.right for bound in bounds_list),
-        top=max(bound.top for bound in bounds_list)
-    )
-
-    # Create a mask for the farm parcels
-    mask_shape = box(*overall_bounds)
-    geo = GeoDataFrame({'geometry': [mask_shape]}, crs=dst_crs)
-
-    # Perform the mosaic operation with reprojection
-    ## XX ERROR HERE
-    mosaic, out_transform = merge(src_files_to_mosaic, dst_crs=dst_crs, resampling=Resampling.nearest)
-
-    # Get metadata from the first file and update it
-    with rasterio.open(src_files_to_mosaic[0]) as src:
-        meta = src.meta.copy()
-
-    meta.update({
-        'crs': dst_crs,
-        'transform': out_transform,
-        'width': mosaic.shape[2],
-        'height': mosaic.shape[1],
-        'count': len(bands_to_save),
-        'nodata': 0,
-        'dtype': 'float32'
+    # Get metadata from the first file and update it for the mosaic
+    out_meta = src_files_to_mosaic[0].meta.copy()
+    out_meta.update({
+        "driver": "GTiff",
+        "height": mosaic.shape[1],
+        "width": mosaic.shape[2],
+        "transform": out_transform,
+        "count": len(bands_to_save)  # Update to the number of bands you're saving
     })
 
-    # Create a mask for areas outside the farm parcels
-    mask = geometry_mask([mapping(geo.geometry.iloc[0])], 
-        out_shape=mosaic.shape[1:], transform=out_transform, invert=True)
+    # If a destination CRS is provided, reproject the mosaic
+    if dst_crs:
+        # Calculate the transform for the new CRS
+        transform, width, height = calculate_default_transform(
+            src_files_to_mosaic[0].crs, dst_crs, out_meta['width'], out_meta['height'], *src_files_to_mosaic[0].bounds
+        )
+        out_meta.update({
+            'crs': dst_crs,
+            'transform': transform,
+            'width': width,
+            'height': height
+        })
 
-    # Apply the mask to the mosaic
-    mosaic = np.ma.masked_array(mosaic, np.broadcast_to(mask, mosaic.shape))
+        # Create an empty array to hold the reprojected mosaic
+        reprojected_mosaic = rasterio.open(output_file, 'w', **out_meta)
+        reproject(
+            source=mosaic,
+            destination=rasterio.band(reprojected_mosaic, 1),
+            src_transform=out_transform,
+            src_crs=src_files_to_mosaic[0].crs,
+            dst_transform=transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest
+        )
+        reprojected_mosaic.close()
+    else:
+        # Write the merged raster without reprojection
+        with rasterio.open(output_file, "w", **out_meta) as dest:
+            dest.write(mosaic)
 
-    # Write the output file
-    with rasterio.open(output_file, "w", **meta) as dest:
-        for i, band_name in enumerate(bands_to_save):
-            if band_info_list:
-                band_index = list(band_info_list[0].values()).index(band_name)
-            else:
-                band_index = available_bands.index(band_name)
-            dest.write(mosaic[band_index], i+1)
-            dest.set_band_description(i+1, band_name)
-
-    print(f"Combined raster saved to {output_file} with CRS: {dst_crs}")
+    # Close all the open files
+    for src in src_files_to_mosaic:
+        src.close()
 
 # Usage
 input_dir = os.path.join(dir['processed'], "sentinel_images")
