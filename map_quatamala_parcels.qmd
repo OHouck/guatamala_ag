@@ -3,7 +3,10 @@ title: "Guatemala Parcels EDA"
 author: "Ozzy Houck"
 date: today
 format: 
-   html 
+    typst:
+        toc: true
+        section-numbering: 1.1.a
+        columns: 2
 execute:
   eval: false 
   echo: false
@@ -18,18 +21,23 @@ import socket
 import pandas as pd
 import numpy as np
 import geopandas as gpd
-import rasterio
 from shapely.geometry import box 
 from shapely.geometry import mapping
 import re # regular expressions
 import folium
 from folium import GeoJson
 from folium.plugins import MarkerCluster
+import rasterio
 from rasterio.merge import merge
 from rasterio.mask import mask
 from rasterio.features import geometry_mask
+from rasterio.warp import calculate_default_transform, reproject, Resampling
 import json
 import warnings
+
+
+# Initialize Earth Engine
+ee.Initialize()
 
 def setup_directories():
     # check if we are on the server or local
@@ -188,18 +196,6 @@ df['lon_max'] = df[['longitude_1', 'longitude_2', 'longitude_3', 'longitude_4']]
 def create_polygon(row):
     return box(row['lon_min'], row['lat_min'], row['lon_max'], row['lat_max'])
 
-# Alternative Function to create a polygon from coordinates
-# def create_polygon(row):
-#     coords = [
-#         (float(row['longitude_1']), float(row['latitude_1'])),
-#         (float(row['longitude_2']), float(row['latitude_2'])),
-#         (float(row['longitude_3']), float(row['latitude_3'])),
-#         (float(row['longitude_4']), float(row['latitude_4'])),
-#         (float(row['longitude_1']), float(row['latitude_1']))  # Close the polygon
-#     ]
-#     return Polygon(coords)
-
-
 # Create the geometry column
 df['geometry'] = df.apply(create_polygon, axis=1)
 
@@ -252,18 +248,16 @@ print(f"GeoDataFrame CRS: {gdf.crs}")
 # print summary statistics for area and round to 2 decimal places
 print(gdf['area_sqm'].describe().round(2))
 
-# save the geodataframe
-gdf.to_file(os.path.join(dir['processed'], "cleaned_parcels.geojson"), driver='GeoJSON')
+# keep only the columns we need
+columns_to_keep = ['id', 'area_sqm', 'geometry']
+gdf = gdf[columns_to_keep]
 
-# create geometry object of all parcels for plotting in earth engine
-ee_geometry = ee.Geometry.MultiPolygon(list(gdf.geometry.apply(lambda x: mapping(x)))) # XX this causes a KeyError: 0 error
+gdf_polygons = ee.Geometry.MultiPolygon(list(gdf.geometry.apply(lambda x: list(mapping(x)['coordinates'][0]))))
+
 ```
-
 
 ### Create Interactive Map showing sentenial 2 imagery and parcel boundaries using GEE
 ```{python}
-# Initialize Earth Engine
-ee.Initialize()
 
 # Create an interactive map
 Map = geemap.Map()
@@ -273,153 +267,80 @@ s2_collection = (ee.ImageCollection('COPERNICUS/S2_SR')
                  .filterDate('2023-01-01', '2023-06-30')
                  .filterBounds(ee.FeatureCollection(gdf.__geo_interface__))
                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-                 .select(['B4', 'B3', 'B2']))
+                 .select(['B8', 'B5', 'B4', 'B3', 'B2']))
 
 # Create a median composite
 s2_median = s2_collection.median()
 
-clipped = s2_median.clip(ee_geometry)
+clipped = s2_median.clip(gdf_polygons)
+
+def add_ndvi(image):
+    # Note B5 is NIR  at 20m resolution wavelength = 705nm
+    # B8 is NVIR at 10m resolution wavelength = 852nm 
+    ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+    return image.addBands(ndvi)
+# clipped = add_ndvi(clipped)
+s2_median = add_ndvi(s2_median)
+
+def zonal_stats(geometry, image):
+    reducer = ee.Reducer.mean()
+    stats = image.reduceRegion(
+        reducer=reducer,
+        geometry=geometry,
+        scale=10, # sentinel 2 resolution is 10m
+        maxPixels=1e8
+    )
+    return stats
+
+results = []
+
+# Calculate zonal stats for each parcel
+for idx, row in gdf.iterrows():
+    parcel_geom = ee.Geometry.Polygon(list(row['geometry'].exterior.coords))
+    stats = zonal_stats(parcel_geom, s2_median)
+
+    # mean valuse for hte bands and NDVI
+    mean_values = stats.getInfo()
+
+    # append to results
+    results.append({
+        'id': row['id'],
+        'mean_B2': mean_values['B2'],
+        'mean_B3': mean_values['B3'],
+        'mean_B4': mean_values['B4'],
+        'mean_B8': mean_values['B8'],
+        'mean_NDVI': mean_values['NDVI']
+    })
+
+# Convert results to a pandas DataFrame
+results_df = pd.DataFrame(results)
+
+# merge back to the original geodataframe
+gdf_sentinel = gdf.merge(results_df, on='id')
+
+# save the geodataframe
+gdf_sentinel.to_file(os.path.join(dir['processed'], "farm_parcels.geojson"), driver='GeoJSON')
 
 # Add the Sentinel-2 layer
-Map.addLayer(s2_median, {'min': 0, 'max': 3000}, 'Sentinel-2 Median')
+Map.addLayer(clipped, {'min': 0, 'max': 3000}, 'Sentinel-2 Median')
 
 # Add the farm parcels
 Map.add_gdf(gdf, layer_name = 'Farm Parcels', fill_colors=['red'])
 
+# zoom in on the first parcel
+centroid = gdf.iloc[0].geometry.centroid
+Map.setCenter(centroid.x, centroid.y, 16)
 
 # Display the map
 Map.save(os.path.join(dir['fig'], 'interactive_map_geemap.html'))
 print(f"Interactive map saved to {os.path.join(dir['fig'], 'interactive_map_geemap.html')}")
+
 ```
-
-### Pull Sentinel 2 Imagery from Google Earth Engine
-
-```{python}
-def get_sentinel2_imagery_multi(geometries, ids, start_date, end_date, output_dir, 
-                                bands_to_save, max_cloud_cover=10):
-    ee.Initialize()
-
-    
-    for geom, id in zip(geometries, ids):
-        try:
-            ee_geometry = ee.Geometry.Polygon(list(geom.exterior.coords))
-            
-            s2_collection = (ee.ImageCollection('COPERNICUS/S2_SR')
-                             .filterBounds(ee_geometry)
-                             .filterDate(start_date, end_date)
-                             .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', max_cloud_cover)))
-            
-            if s2_collection.size().getInfo() == 0:
-                print(f"No images found for geometry {id}. Skipping.")
-                continue
-
-            # normalized difference vegetation index
-            def addNDVI(image):
-                ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
-                return image.addBands(ndvi)
-
-            # green chlorophyl vegetation index (not using but used in SCYM)
-            def addGCVI(image):
-                gcvi = image.normalizedDifference(['B8', 'B3']).rename('GCVI')  # B8: NIR, B3: Green
-                return image.addBands(gcvi)
-
-            # Add NDVI band
-            s2_collection = s2_collection.map(addNDVI)
-
-            # Sort by NDVI and select the image with the highest NDVI
-            s2_collection = s2_collection.sort('NDVI', False)
-            selected_image = ee.Image(s2_collection.first())
-            
-            clipped = selected_image.clip(ee_geometry)
-            output_file = os.path.join(output_dir, f"sentinel_image_{id}.tif")
-
-            geemap.ee_export_image(clipped, filename=output_file, scale=10, region=ee_geometry)
-
-            # Save band information
-            band_info = {i+1: name for i, name in enumerate(bands_to_save)}
-            with open(os.path.join(output_dir, f"sentinel_image_{id}_bands.json"), 'w') as f:
-                json.dump(band_info, f)
-            
-            print(f"Sentinel image for geometry {id} saved to {output_file}")
-            
-        except Exception as e:
-            print(f"Error processing geometry {id}: {str(e)}")
-
-    print("All individual Sentinel images have been saved.")
-
-# Usage
-geometries = gdf.geometry.tolist()
-ids = gdf.id.tolist()
-
-# # take 10 percent sample for testing
-geometries = geometries[::10]
-ids = ids[::10]
-
-output_dir = os.path.join(dir['processed'], "sentinel_images")
-os.makedirs(output_dir, exist_ok=True)
-
-# currently saving all bands but might not be necessary
-bands_to_save = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 
-                    'B9', 'B10', 'B11', 'B12', "NDVI", "id"]
-
-get_sentinel2_imagery_multi(geometries, ids, '2023-01-01', '2023-06-30', 
-                            output_dir, bands_to_save)
-```
-
-```{python}
-import rasterio
-from rasterio.merge import merge
-import glob
-import os
-
-# Define the directory containing your Sentinel-2 images
-input_dir = os.path.join(dir['processed'], "sentinel_images")
-
-# Get a list of all .tif files
-tif_files = glob.glob(os.path.join(input_dir, 'sentinel_image_*.tif'))
-
-# Open all the images
-src_files_to_mosaic = []
-for tif in tif_files:
-    src = rasterio.open(tif)
-    src_files_to_mosaic.append(src)
-
-# Merge them into a single mosaic
-mosaic, out_trans = merge(src_files_to_mosaic)
-
-# Update the metadata
-out_meta = src.meta.copy()
-out_meta.update({
-    "driver": "GTiff",
-    "height": mosaic.shape[1],
-    "width": mosaic.shape[2],
-    "transform": out_trans,
-    "crs": src.crs
-})
-
-# Write the mosaic to disk
-mosaic_path = os.path.join(input_dir, "sentinel_mosaic.tif")
-with rasterio.open(mosaic_path, "w", **out_meta) as dest:
-    dest.write(mosaic)
-
-print(f"Mosaic saved to {mosaic_path}")
-```
-
-
-
-
-
-
-
 
 
 ### Combine TIF Files into a single raster (OLD CODE )
 
 ```{python}
-import os
-import rasterio
-from rasterio.merge import merge
-from rasterio.warp import calculate_default_transform, reproject, Resampling
 
 def combine_tif_files(input_dir, output_file, bands_to_save, dst_crs=None):
     # Get all the tif files from the input directory
