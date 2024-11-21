@@ -32,6 +32,10 @@ from rasterio.merge import merge
 from rasterio.mask import mask
 from rasterio.features import geometry_mask
 from rasterio.warp import calculate_default_transform, reproject, Resampling
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
 import json
 import warnings
 
@@ -137,12 +141,12 @@ def split_coordinates(coord_str):
 
 df = pd.read_excel(os.path.join(dir['raw'], "Datos de Impacto Productores 2023.xlsx"), 
     sheet_name= 0, skiprows=4)
+
 vars_to_keep = ["id_phone", "id_coordinates_1", "id_coordinates_2", 
                 "id_coordinates_3", "id_coordinates_4"]
 df = df[vars_to_keep]
 # drop rows with missing id_coordinates_1
 df = df.dropna(subset=["id_coordinates_1"])
-
 
 # Process coordinates
 for i in range(1, 5):
@@ -177,6 +181,18 @@ for i in range(1, 5):
 # Check if all coordinates are valid
 all_valid = df.apply(lambda row: all(row[f'valid_coordinate_{i}'] for i in range(1, 5)), axis=1)
 print(f"\nTotal rows with all valid coordinates: {all_valid.sum()} out of {len(df)}")
+
+# merge to yield in another sheet
+df_yield = pd.read_excel(os.path.join(dir['raw'], "Datos de Impacto Productores 2023.xlsx"), 
+    sheet_name= 1, skiprows=2)
+
+df_yield = df_yield[["id_phone", "harv_product_qqmz"]]
+# remove rows with missing values
+df_yield = df_yield.dropna(subset=["harv_product_qqmz"])
+
+# merge the two dataframes
+df = df.merge(df_yield, on="id_phone", how="inner")
+print(f"\nMerged data shape: {df.shape}")
 
 # Save the processed data
 df.to_csv(os.path.join(dir['processed'], "coordinates_processed.csv"), index=False)
@@ -249,7 +265,7 @@ print(f"GeoDataFrame CRS: {gdf.crs}")
 print(gdf['area_sqm'].describe().round(2))
 
 # keep only the columns we need
-columns_to_keep = ['id', 'area_sqm', 'geometry']
+columns_to_keep = ['id', 'area_sqm', 'geometry', "harv_product_qqmz"]
 gdf = gdf[columns_to_keep]
 
 gdf_polygons = ee.Geometry.MultiPolygon(list(gdf.geometry.apply(lambda x: list(mapping(x)['coordinates'][0]))))
@@ -257,6 +273,80 @@ gdf_polygons = ee.Geometry.MultiPolygon(list(gdf.geometry.apply(lambda x: list(m
 ```
 
 ### Create Interactive Map showing sentenial 2 imagery and parcel boundaries using GEE
+
+```{python}
+import geemap
+import ee
+import pandas as pd
+import os
+
+# Initialize the Earth Engine library
+ee.Initialize()
+
+# Create an interactive map
+Map = geemap.Map()
+
+# Load the Sentinel-2 image collection
+s2_collection = (ee.ImageCollection('COPERNICUS/S2_SR')
+                 .filterDate('2023-01-01', '2023-06-30')
+                 .filterBounds(ee.FeatureCollection(gdf.__geo_interface__))
+                 .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+                 .select(['B8', 'B4', 'B3', 'B2']))
+
+# Create a median composite
+s2_median = s2_collection.median()
+
+# Clip to parcel boundaries
+clipped = s2_median.clip(ee.FeatureCollection(gdf.__geo_interface__))
+
+# Add NDVI computation
+def add_ndvi(image):
+    ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+    return image.addBands(ndvi)
+
+s2_median = add_ndvi(s2_median)
+
+# Visualization parameters
+ndvi_vis_params = {
+    'min': 0,
+    'max': 1,
+    'palette': ['blue', 'white', 'green']
+}
+
+rgb_vis_params = {
+    'bands': ['B4', 'B3', 'B2'],  # RGB bands
+    'min': 0,
+    'max': 3000
+}
+
+# Add layers to the map
+# Add a base map with streets and administrative regions
+Map.add_basemap('HYBRID')
+Map.addLayer(s2_median.select('NDVI'), ndvi_vis_params, 'NDVI')
+Map.addLayer(s2_median, rgb_vis_params, 'Sentinel-2 RGB')
+
+# Add translucent red boxes for parcels
+parcel_style = {
+    'color': 'red',
+    'fillColor': 'red',
+    'fillOpacity': 0.3
+}
+Map.add_gdf(gdf, layer_name='Farm Parcels', style=parcel_style)
+
+
+# Add a LayerControl widget for toggling layers
+Map.addLayerControl()
+
+# Zoom in on the first parcel
+centroid = gdf.iloc[0].geometry.centroid
+Map.setCenter(centroid.x, centroid.y, 16)
+
+# Save and display the map
+output_file = os.path.join(dir['fig'], 'interactive_map_geemap.html')
+Map.save(output_file)
+print(f"Interactive map saved to {output_file}")
+
+```
 ```{python}
 
 # Create an interactive map
@@ -334,6 +424,49 @@ Map.setCenter(centroid.x, centroid.y, 16)
 # Display the map
 Map.save(os.path.join(dir['fig'], 'interactive_map_geemap.html'))
 print(f"Interactive map saved to {os.path.join(dir['fig'], 'interactive_map_geemap.html')}")
+
+```
+
+```{python}
+# read in the geodataframe
+gdf_sentinel = gpd.read_file(os.path.join(dir['processed'], "farm_parcels.geojson"))
+
+# plot relationship between NDVI and yield
+plt.figure(figsize=(10, 6))
+plt.scatter(gdf_sentinel['mean_NDVI'], gdf_sentinel['harv_product_qqmz'])
+plt.xlabel('Mean NDVI')
+plt.ylabel('Harvested Product (QQMZ)')
+plt.title('Relationship between NDVI and Harvested Product')
+plt.savefig(os.path.join(dir['fig'], 'scatter_ndvi_vs_yield.png'))
+
+
+# split the data
+X = gdf_sentinel[['mean_NDVI']]
+y = gdf_sentinel['harv_product_qqmz']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# fit the model
+# run naive ols prediction of yield using NDVI
+model = LinearRegression()
+model.fit(X_train, y_train)
+
+# make predictions
+y_pred = model.predict(X_test)
+
+# calculate the mean squared error
+mse = mean_squared_error(y_test, y_pred)
+print(f"Mean Squared Error: {mse}")
+
+# plot the results
+plt.figure(figsize=(10, 6))
+plt.scatter(X_test, y_test, color='blue', label='True values')
+plt.scatter(X_test, y_pred, color='red', label='Predicted values')
+plt.xlabel('Mean NDVI')
+plt.ylabel('Harvested Product (QQMZ)')
+plt.title('Predicted vs. True Harvested Product')
+plt.legend()
+plt.savefig(os.path.join(dir['fig'], 'naive_ols_yield_prediction.png'))
 
 ```
 
