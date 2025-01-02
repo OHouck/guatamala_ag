@@ -195,8 +195,8 @@ df = df.merge(df_yield, on="id_phone", how="inner")
 print(f"\nMerged data shape: {df.shape}")
 
 # Save the processed data
-df.to_csv(os.path.join(dir['processed'], "coordinates_processed.csv"), index=False)
-print("\nData processing complete. Results saved to 'coordinates_processed.csv'.")
+df.to_csv(os.path.join(dir['processed'], "farm_coordinates.csv"), index=False)
+print("\nData processing complete. Results saved to 'farm_coordinates.csv'.")
 ```
 
 ### Convert to GeoDataFrame and Calculate Area
@@ -268,6 +268,10 @@ print(gdf['area_sqm'].describe().round(2))
 columns_to_keep = ['id', 'area_sqm', 'geometry', "harv_product_qqmz"]
 gdf = gdf[columns_to_keep]
 
+# save csv with id and harv_product_qqmz to use as a crosswalk
+crosswalk = gdf[['id', 'harv_product_qqmz']]
+crosswalk.to_csv(os.path.join(dir['processed'], "id_harvest_crosswalk.csv"), index=False)
+
 gdf_polygons = ee.Geometry.MultiPolygon(list(gdf.geometry.apply(lambda x: list(mapping(x)['coordinates'][0]))))
 
 ```
@@ -288,10 +292,11 @@ Map = geemap.Map()
 
 # Load the Sentinel-2 image collection
 s2_collection = (ee.ImageCollection('COPERNICUS/S2_SR')
-                 .filterDate('2023-01-01', '2023-06-30')
+                 .filterDate('2023-01-03', '2023-06-30')
                  .filterBounds(ee.FeatureCollection(gdf.__geo_interface__))
                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-                 .select(['B8', 'B4', 'B3', 'B2']))
+                 .select(['B2', 'B3', 'B4', 'B8']) 
+)
 
 # Create a median composite
 s2_median = s2_collection.median()
@@ -306,6 +311,10 @@ def add_ndvi(image):
 
 s2_median = add_ndvi(s2_median)
 
+
+#==============================================================================
+# Sidetrack to make a map
+#==============================================================================
 # Visualization parameters
 ndvi_vis_params = {
     'min': 0,
@@ -329,10 +338,9 @@ Map.addLayer(s2_median, rgb_vis_params, 'Sentinel-2 RGB')
 parcel_style = {
     'color': 'red',
     'fillColor': 'red',
-    'fillOpacity': 0.3
+    'fillOpacity': 0.7
 }
 Map.add_gdf(gdf, layer_name='Farm Parcels', style=parcel_style)
-
 
 # Add a LayerControl widget for toggling layers
 Map.addLayerControl()
@@ -346,10 +354,243 @@ output_file = os.path.join(dir['fig'], 'interactive_map_geemap.html')
 Map.save(output_file)
 print(f"Interactive map saved to {output_file}")
 
-```
-```{python}
+#==============================================================================
+# 2. Export 64x64 patches around each farm’s centroid
+#==============================================================================
 
-# Create an interactive map
+# For Sentinel-2 at 10m resolution, a 64×64 patch is 640×640 meters.
+# We'll create a 640m bounding box around the centroid of each parcel.
+output_dir = os.path.join(dir["processed"], "farm_patch_sentinel2")
+os.makedirs(output_dir, exist_ok=True)
+
+for idx, row in gdf.iterrows():
+    farm_id = row["id"]
+    
+    # Convert Shapely geometry to EE geometry
+    farm_geom_ee = ee.Geometry(mapping(row["geometry"]))
+    
+    # Get centroid in Earth Engine
+    centroid = farm_geom_ee.centroid()
+    
+    # Create a ~640m bounding box around the centroid:
+    #    buffer(320) => circle of radius 320 m
+    #    .bounds()   => convert that circle to a bounding rectangle
+    patch_region = centroid.buffer(320).bounds()
+    
+    # Clip the median composite to that patch region
+    patch_image = s2_median.clip(patch_region)
+    
+    # Build output path
+    out_file = os.path.join(output_dir, f"{farm_id}.tif")
+    
+    # Export the patch as a GeoTIFF.  
+    #   scale=10 → each pixel = 10m, so final image ~ 64×64 pixels
+    #   region   → bounding geometry
+    #   file_per_band=False → combine bands into one file (instead of multiple .tif files)
+    geemap.ee_export_image(
+        ee_object=patch_image.select('B2', 'B3', 'B4'),  #OH: will want to change to add NDVI, might require modifying pretrained model
+        filename=out_file,
+        scale=10,
+        region=patch_region.getInfo()["coordinates"],
+        crs="EPSG:4326",           # adjust if you want another projection
+        file_per_band=False
+    )
+    
+    print(f"Saved 64×64 NDVI patch for parcel {farm_id} → {out_file}")
+```
+
+# Pytorch model
+
+# todo: implement this code from https://chatgpt.com/c/67742cbe-fb50-8007-bf19-b5527e012838
+
+
+
+## Set up the PyTorch Dataset
+```{python}
+import os
+import torch
+import numpy as np
+import pandas as pd
+from torchgeo.datasets import RasterDataset
+
+
+class Sentinel2FarmParcels(RasterDataset):
+    """
+    A TorchGeo-style dataset for multi-band Sentinel-2 .tif images stored locally.
+    
+    Expects:
+        - Each farm has exactly one multi-band .tif (e.g. B2, B3, B4, B8 stacked).
+        - A CSV mapping farm_id -> yield.
+    """
+    def __init__(self, root: str, csv_file: str, transforms=None) -> None:
+        """
+        Args:
+            root      (str): Directory containing multi-band .tif files.
+            csv_file  (str): Path to CSV with columns [farm_id, yield].
+            transforms     : Optional transforms/augmentations to apply.
+        """
+        # Pass root and transforms to the parent RasterDataset (custom Raster data)
+        super().__init__(paths=root, transforms=transforms)
+        self.root = root
+        self.df = pd.read_csv(csv_file)
+        self.transforms = transforms
+
+
+        # We'll store "samples" with { 'path': <path to .tif>, 'yield': <float> }
+        self.samples = []
+        for _, row in self.df.iterrows():
+            farm_id = int(row["id"])
+            yield_val = float(row["harv_product_qqmz"])
+            tif_path = os.path.join(self.root, f"{farm_id}.tif")
+
+            if not os.path.isfile(tif_path):
+                raise FileNotFoundError(
+                    f"Expected file {tif_path} for farm_id={farm_id}, but not found."
+                )
+
+            self.samples.append({
+                "farm_id": farm_id,
+                "yield": yield_val,
+                "path": tif_path
+            })
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        """
+        Returns:
+            image_tensor: (C, H, W) torch.FloatTensor
+            label_tensor: (1,) torch.FloatTensor
+        """
+        sample = self.samples[index]
+        tif_path = sample["path"]
+        yield_val = sample["yield"]
+
+
+       # load multiband raster using rasterio
+        with rasterio.open(tif_path) as src:
+            img_array = src.read()  # shape: (bands, height, width)
+        # Convert to float32
+        img_array = img_array.astype(np.float32)
+
+        # 2) Wrap image and label in torch tensors
+        image_tensor = torch.from_numpy(img_array)             # shape: (C, H, W)
+        label_tensor = torch.tensor([yield_val], dtype=torch.float32)  # shape: (1,)
+
+        # 3) Apply any optional transforms or augmentations
+        #    (Might need a custom transform function if you use geospatial ops)
+        if self.transforms:
+            image_tensor, label_tensor = self.transforms(image_tensor, label_tensor)
+
+        return image_tensor, label_tensor
+```
+
+
+```{python}
+dataset = Sentinel2FarmParcels(
+    root= os.path.join(dir['processed'], "farm_patch_sentinel2"),
+    csv_file=os.path.join(dir['processed'], "id_harvest_crosswalk.csv")
+)
+
+print(f"Dataset length: {len(dataset)}")
+
+image, label = dataset[40]
+print("Image shape:", image.shape)  # e.g., (4, H, W) if you have 4 bands
+print("Label:", label.item())       # yield float
+
+from torch.utils.data import random_split, DataLoader
+
+# split into train and validation sets
+train_size = int(0.8 * len(dataset))
+val_size = len(dataset) - train_size
+train_ds, val_ds = random_split(dataset, [train_size, val_size])
+
+train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=1)
+val_loader = DataLoader(val_ds, batch_size=2, shuffle=False, num_workers=1)
+
+# helper function to plot an image in the dataset
+def plot_image(image, label):
+    # Plot the RGB image
+    # OH: note will have to modify if more than rgb bands are used
+    # b2, b3, b4 is blue, green red so reorder to rgb
+    rgb_indices = [2, 1, 0]
+    rgb_image = image[rgb_indices, :, :].numpy()  # Convert to NumPy array and put colors in corect order
+    rgb_image = np.moveaxis(rgb_image, 0, -1) # move rbg to last axis
+    # normalize rbg values to 0-1
+    rgb_image = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min())
+    plt.imshow(rgb_image)
+    plt.title(f"Yield: {label.item()}")
+    plt.axis("off")
+    plt.show()
+
+plot_image(image, label)
+
+```
+
+## Train a model using resnet50
+
+# OH to do: Figure out how to initialize weights from other modes and deal with run time error
+
+```{python}
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchgeo.models import resnet18, ResNet18_Weights
+
+# Example: BigEarthNet pretrained ResNet18
+# model = resnet18(weights=ResNet18_Weights.SENTINEL2_RGB_MOCO)
+model = resnet18(weights=None)
+# ... Adapt first conv for # of channels if needed, adapt final layer for 1 output ...
+# model = model.cuda()
+
+# Want to predict yield and not class so change final layer to have 1 output
+model.fc = nn.Linear(model.fc.in_features, 1)
+
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+epochs = 5
+
+for epoch in range(epochs):
+    # Training loop
+    model.train()
+    running_loss = 0.0
+    for images, labels in train_loader:
+        images = images.cuda()
+        labels = labels.cuda()
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    train_loss = running_loss / len(train_loader)
+
+    # Validation loop, etc.
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.cuda()
+            labels = labels.cuda()
+
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item()
+    val_loss /= len(val_loader)
+
+    print(f"Epoch [{epoch+1}/{epochs}] - "
+          f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+```
+
+
+# scrap yard
+```{python}
+# CODE FOR CREATING INTERACTIVE MAP AND EXTRACTING MEAN NDVI
 Map = geemap.Map()
 
 # Load the Sentinel-2 image collection
@@ -424,7 +665,6 @@ Map.setCenter(centroid.x, centroid.y, 16)
 # Display the map
 Map.save(os.path.join(dir['fig'], 'interactive_map_geemap.html'))
 print(f"Interactive map saved to {os.path.join(dir['fig'], 'interactive_map_geemap.html')}")
-
 ```
 
 ```{python}
@@ -438,7 +678,6 @@ plt.xlabel('Mean NDVI')
 plt.ylabel('Harvested Product (QQMZ)')
 plt.title('Relationship between NDVI and Harvested Product')
 plt.savefig(os.path.join(dir['fig'], 'scatter_ndvi_vs_yield.png'))
-
 
 # split the data
 X = gdf_sentinel[['mean_NDVI']]
@@ -467,213 +706,4 @@ plt.ylabel('Harvested Product (QQMZ)')
 plt.title('Predicted vs. True Harvested Product')
 plt.legend()
 plt.savefig(os.path.join(dir['fig'], 'naive_ols_yield_prediction.png'))
-
-```
-
-
-### Combine TIF Files into a single raster (OLD CODE )
-
-```{python}
-
-def combine_tif_files(input_dir, output_file, bands_to_save, dst_crs=None):
-    # Get all the tif files from the input directory
-    tif_files = [os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith('.tif')]
-
-    # Open all the tif files
-    src_files_to_mosaic = [rasterio.open(f) for f in tif_files]
-
-    # Merge the files into a mosaic
-    mosaic, out_transform = merge(src_files_to_mosaic)
-
-    # Get metadata from the first file and update it for the mosaic
-    out_meta = src_files_to_mosaic[0].meta.copy()
-    out_meta.update({
-        "driver": "GTiff",
-        "height": mosaic.shape[1],
-        "width": mosaic.shape[2],
-        "transform": out_transform,
-        "count": len(bands_to_save)  # Update to the number of bands you're saving
-    })
-
-    # If a destination CRS is provided, reproject the mosaic
-    if dst_crs:
-        # Calculate the transform for the new CRS
-        transform, width, height = calculate_default_transform(
-            src_files_to_mosaic[0].crs, dst_crs, out_meta['width'], out_meta['height'], *src_files_to_mosaic[0].bounds
-        )
-        out_meta.update({
-            'crs': dst_crs,
-            'transform': transform,
-            'width': width,
-            'height': height
-        })
-
-        # Create an empty array to hold the reprojected mosaic
-        reprojected_mosaic = rasterio.open(output_file, 'w', **out_meta)
-        reproject(
-            source=mosaic,
-            destination=rasterio.band(reprojected_mosaic, 1),
-            src_transform=out_transform,
-            src_crs=src_files_to_mosaic[0].crs,
-            dst_transform=transform,
-            dst_crs=dst_crs,
-            resampling=Resampling.nearest
-        )
-        reprojected_mosaic.close()
-    else:
-        # Write the merged raster without reprojection
-        with rasterio.open(output_file, "w", **out_meta) as dest:
-            dest.write(mosaic)
-
-    # Close all the open files
-    for src in src_files_to_mosaic:
-        src.close()
-
-# Usage
-input_dir = os.path.join(dir['processed'], "sentinel_images")
-output_file = os.path.join(dir['processed'], "merged_sentinel_image.tif")
-bands_to_save = ['B2', 'B3', 'B4', 'B8', 'NDVI']  # Adjust as needed
-
-combine_tif_files(input_dir, output_file, bands_to_save)
-```
-
-### Create interactive map with folium
-
-```{python}
-import rasterio
-import geopandas as gpd
-import matplotlib.pyplot as plt
-
-def verify_data(raster_file, parcel_file):
-    # Check raster data
-    with rasterio.open(raster_file) as src:
-        print(f"Raster CRS: {src.crs}")
-        print(f"Raster Bounds: {src.bounds}")
-        print(f"Raster Shape: {src.shape}")
-        
-        # Plot the first band of the raster
-        plt.figure(figsize=(10, 10))
-        plt.imshow(src.read(1), cmap='viridis')
-        plt.title("First Band of Raster Data")
-        plt.colorbar()
-        plt.savefig("raster_preview.png")
-        plt.close()
-
-    # Check parcel data
-    parcels = gpd.read_file(parcel_file)
-    print(f"Parcels CRS: {parcels.crs}")
-    print(f"Number of parcels: {len(parcels)}")
-    print(f"Parcels Bounds: {parcels.total_bounds}")
-    
-    # Plot parcels
-    parcels.plot(figsize=(10, 10))
-    plt.title("Parcel Boundaries")
-    plt.savefig("parcels_preview.png")
-    plt.close()
-
-    return parcels
-
-# Use the function
-raster_file = os.path.join(dir['processed'], "merged_sentinel_image.tif")
-parcel_file = os.path.join(dir['processed'], "cleaned_parcels.geojson")
-parcels = verify_data(raster_file, parcel_file)
-
-# Check if parcels intersect with raster
-with rasterio.open(raster_file) as src:
-    raster_bounds = src.bounds
-    raster_geom = gpd.GeoDataFrame({'geometry': [box(*raster_bounds)]}, crs=src.crs)
-    parcels_reprojected = parcels.to_crs(src.crs)
-    intersection = gpd.overlay(parcels_reprojected, raster_geom, how='intersection')
-    print(f"Number of parcels intersecting with raster: {len(intersection)}")
-
-```
-
-```{python}
-import os
-import rasterio
-import numpy as np
-import folium
-from folium import raster_layers
-import geopandas as gpd
-from rasterio.warp import transform_bounds
-from pyproj import Transformer
-import logging
-
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def create_interactive_map(raster_file, parcel_file, output_file, max_zoom=18):
-    try:
-        logging.info("Starting to create interactive map")
-        
-        # Read the raster file
-        with rasterio.open(raster_file) as src:
-            logging.info(f"Opened raster file: {raster_file}")
-            
-            # Get raster metadata without reading all the data
-            bounds = src.bounds
-            transform = src.transform
-            crs = src.crs
-            
-            # Transform bounds to lat/lon (EPSG:4326)
-            transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-            minx, miny = transformer.transform(bounds.left, bounds.bottom)
-            maxx, maxy = transformer.transform(bounds.right, bounds.top)
-        
-        logging.info("Transformed raster bounds to lat/lon")
-
-        # Read the parcel shapefile
-        parcels = gpd.read_file(parcel_file)
-        logging.info(f"Read parcel file: {parcel_file}")
-
-         # Get the centroid of the first parcel
-        first_parcel_centroid = parcels.iloc[0].geometry.centroid
-        center_lat, center_lon = first_parcel_centroid.y, first_parcel_centroid.x
-
-        # Create a map centered on the first parcel
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=16, max_zoom=max_zoom)
-
-        # Add the raster layer as a TileLayer for memory efficiency
-        url = f"http://localhost:8080/raster/{os.path.basename(raster_file)}" + "/{z}/{x}/{y}.png"
-        raster_layer = folium.raster_layers.TileLayer(
-            tiles=url,
-            attr="Raster Data",
-            name="Raster Layer",
-            overlay=True,
-            opacity=0.7
-        )
-        raster_layer.add_to(m)
-
-        logging.info("Added raster layer to map")
-
-        # Add parcel boundaries
-        folium.GeoJson(
-            parcels,
-            name="Farm Parcels",
-            style_function=lambda feature: {
-                'fillColor': 'blue',
-                'color': 'black',
-                'weight': 2,
-                'fillOpacity': 0.1,
-            }
-        ).add_to(m)
-
-        logging.info("Added parcel boundaries to map")
-
-        # Add a layer control
-        folium.LayerControl().add_to(m)
-
-        # Save the map
-        m.save(output_file)
-        logging.info(f"Interactive map saved to {output_file}")
-
-    except Exception as e:
-        logging.error(f"An error occurred: {str(e)}", exc_info=True)
-        raise
-
-raster_file = os.path.join(dir['processed'], "merged_sentinel_image.tif")
-parcel_file= os.path.join(dir['processed'], "cleaned_parcels.geojson") 
-output_file = os.path.join(dir['fig'], "interactive_map.html")
-
-create_interactive_map(raster_file, parcel_file, output_file)
 ```
